@@ -1,0 +1,24 @@
+# Data and exports
+data/
+exports/
+runs/
+*.pt
+*.onnx
+*.db
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+.pytest_cache/
+
+# Build
+build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+
+# macOS
+.DS_Store
