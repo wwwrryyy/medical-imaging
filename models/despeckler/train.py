@@ -1,29 +1,40 @@
 """
 train.py
 ========
-Training script for the Spiking Despeckler (Stage 1).
+Training pipeline for Stage 1 Despeckling:
+1. ConvUNet (CNN Default, T=1, continuous activations)
+2. SpikingUNet (SNN Baseline, T=4, Leaky Integrate-and-Fire dynamics)
 
-Loss: MSE + SSIM to preserve structural edges while minimizing pixel error.
-Data: On-the-fly synthetic corruption using corruption.py.
+Loss Function: MSE + lambda * (1 - SSIM)
+Hardware: Apple Silicon MPS / NVIDIA CUDA / CPU
+Tracking: TensorBoard + per-run JSON checkpoints
 """
 
 import os
 import sys
+import csv
+import json
 import argparse
-import glob
+from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.tensorboard import SummaryWriter
 
-from model import SpikingUNet
-from corruption import corrupt_image, load_and_normalize
+try:
+    from model import get_despeckler
+    from corruption import corrupt_image, load_and_normalize
+except ImportError:
+    from models.despeckler.model import get_despeckler
+    from models.despeckler.corruption import corrupt_image, load_and_normalize
 
 
 # ---------------------------------------------------------------------------
-# SSIM loss component
+# SSIM Loss Component
 # ---------------------------------------------------------------------------
 
 def _gaussian_kernel_1d(size: int, sigma: float) -> torch.Tensor:
@@ -45,15 +56,7 @@ def ssim_loss(
     C1: float = 0.01 ** 2,
     C2: float = 0.03 ** 2,
 ) -> torch.Tensor:
-    """Compute 1 - SSIM as a differentiable loss.
-
-    Args:
-        pred: Predicted image [B, C, H, W].
-        target: Ground truth image [B, C, H, W].
-
-    Returns:
-        Scalar loss (1 - mean SSIM), in [0, 1].
-    """
+    """Computes differentiable 1 - SSIM loss in [0, 1]."""
     channels = pred.size(1)
     kernel = _gaussian_kernel_2d(window_size).to(pred.device, pred.dtype)
     kernel = kernel.expand(channels, 1, window_size, window_size)
@@ -76,159 +79,226 @@ def ssim_loss(
 
 
 # ---------------------------------------------------------------------------
-# Dataset
+# Dataset with Clinical Split Support
 # ---------------------------------------------------------------------------
 
-class DespeckleDataset(Dataset):
-    """On-the-fly corrupted/clean pair dataset.
-
-    If `image_dir` is provided, loads real images from disk.
-    Otherwise generates synthetic terrain (useful for testing without data).
+class OCTDespeckleDataset(Dataset):
     """
-
+    Loads OCT scans and corresponding pseudo-clean NLM targets.
+    Applies calibrated on-the-fly multiplicative speckle corruption to the clean target
+    to generate strict 1:1 input/ground-truth pairs:
+        [Corrupted Synthetic Scan] -> [Pseudo-Clean Target Scan]
+    """
     def __init__(
         self,
-        image_dir: str = None,
-        num_synthetic: int = 1000,
-        height: int = 128,
-        width: int = 128,
+        split_csv: str = None,
+        processed_dir: str = "data/processed/nlm",
+        num_synthetic: int = 500,
+        height: int = 256,
+        width: int = 256,
         seed: int = 42,
     ):
         self.h = height
         self.w = width
         self.rng = np.random.default_rng(seed)
+        self.pairs = []
 
-        if image_dir and os.path.isdir(image_dir):
-            exts = ("*.png", "*.jpg", "*.jpeg", "*.tif", "*.tiff", "*.bmp")
-            self.paths = []
-            for ext in exts:
-                self.paths.extend(glob.glob(os.path.join(image_dir, ext)))
-            if not self.paths:
-                raise FileNotFoundError(f"No images found in {image_dir}")
-            self.synthetic = False
-        else:
-            self.num_synthetic = num_synthetic
+        if split_csv and os.path.exists(split_csv):
+            split_name = Path(split_csv).stem
+            with open(split_csv, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    raw_p = Path(row["image_path"])
+                    cls_name = row["class"]
+                    target_p = Path(processed_dir) / split_name / cls_name / f"{raw_p.stem}.png"
+                    
+                    # If precomputed target exists, use it; else fallback to raw resized
+                    clean_source = str(target_p) if target_p.exists() else str(raw_p)
+                    self.pairs.append(clean_source)
+
+        if not self.pairs:
             self.synthetic = True
+            self.num_synthetic = num_synthetic
+        else:
+            self.synthetic = False
 
     def __len__(self):
-        return self.num_synthetic if self.synthetic else len(self.paths)
+        return self.num_synthetic if self.synthetic else len(self.pairs)
 
-    def _generate_terrain(self) -> np.ndarray:
-        """Generate a synthetic terrain patch in [0, 1] float32."""
+    def _generate_synthetic_oct(self) -> np.ndarray:
+        """Generates synthetic layered retinal tissue texture."""
         x = np.linspace(0, 1, self.w)
         y = np.linspace(0, 1, self.h)
         xx, yy = np.meshgrid(x, y)
-        freq = self.rng.uniform(2.0, 10.0)
-        phase = self.rng.uniform(0, 2 * np.pi)
-        terrain = 0.5 + 0.3 * np.sin(freq * xx + phase) * np.cos(freq * yy)
-        texture = self.rng.normal(0.0, 0.04, (self.h, self.w))
-        return np.clip(terrain + texture, 0.0, 1.0).astype(np.float32)
+        freq = self.rng.uniform(3.0, 8.0)
+        # Layered retinal bands with horizontal stratification
+        layers = 0.5 + 0.3 * np.sin(freq * yy) * np.cos(1.0 * xx)
+        texture = self.rng.normal(0.0, 0.03, (self.h, self.w))
+        return np.clip(layers + texture, 0.0, 1.0).astype(np.float32)
 
     def __getitem__(self, idx):
         if self.synthetic:
-            clean = self._generate_terrain()
+            clean = self._generate_synthetic_oct()
         else:
-            clean = load_and_normalize(self.paths[idx], grayscale=True)
-            # Resize to fixed dimensions
-            import cv2
-            clean = cv2.resize(clean, (self.w, self.h), interpolation=cv2.INTER_AREA)
+            path = self.pairs[idx]
+            img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+            if img is None:
+                clean = self._generate_synthetic_oct()
+            else:
+                if (img.shape[1], img.shape[0]) != (self.w, self.h):
+                    img = cv2.resize(img, (self.w, self.h), interpolation=cv2.INTER_AREA)
+                clean = img.astype(np.float32) / 255.0
 
+        # Apply calibrated multiplicative speckle
         corrupted = corrupt_image(clean, rng=self.rng)
 
-        # Shape: [1, H, W] (single channel)
         clean_t = torch.from_numpy(clean[np.newaxis])
         corrupted_t = torch.from_numpy(corrupted[np.newaxis])
         return corrupted_t, clean_t
 
 
 # ---------------------------------------------------------------------------
-# Training loop
+# Training & Validation Loop
 # ---------------------------------------------------------------------------
 
-def train(args):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[*] Device: {device}")
+def train_despeckler(args):
+    # Select hardware device: Apple Silicon MPS -> CUDA -> CPU
+    if torch.backends.mps.is_available() and not args.force_cpu:
+        device = torch.device("mps")
+    elif torch.cuda.is_available() and not args.force_cpu:
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
 
-    model = SpikingUNet(
+    print(f"[*] Training Device: {device}")
+    print(f"[*] Architecture: {args.model_type.upper()} Despeckler (base_ch={args.base_ch})")
+
+    model = get_despeckler(
+        model_type=args.model_type,
         in_channels=1,
         base_ch=args.base_ch,
         num_steps=args.num_steps,
         beta=args.beta,
     ).to(device)
 
-    dataset = DespeckleDataset(
-        image_dir=args.data_dir,
+    train_dataset = OCTDespeckleDataset(
+        split_csv=args.train_split,
+        processed_dir=args.processed_dir,
         num_synthetic=args.num_synthetic,
         height=args.height,
         width=args.width,
+        seed=args.seed,
     )
-    loader = DataLoader(
-        dataset, batch_size=args.batch_size, shuffle=True, num_workers=0
+    val_dataset = OCTDespeckleDataset(
+        split_csv=args.val_split,
+        processed_dir=args.processed_dir,
+        num_synthetic=max(50, args.num_synthetic // 5),
+        height=args.height,
+        width=args.width,
+        seed=args.seed + 1,
     )
+
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.workers)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers)
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     mse_fn = nn.MSELoss()
 
-    print(f"[+] Training S-UNet for {args.epochs} epochs "
-          f"({len(dataset)} samples, batch_size={args.batch_size})")
+    log_dir = os.path.join(args.runs_dir, f"{args.model_type}_despeckler")
+    writer = SummaryWriter(log_dir=log_dir)
 
-    best_loss = float("inf")
+    print(f"[+] Starting training for {args.epochs} epochs ({len(train_dataset)} train, {len(val_dataset)} val)...")
+
+    best_val_loss = float("inf")
+    os.makedirs(args.output_dir, exist_ok=True)
+    best_ckpt_path = os.path.join(args.output_dir, f"despeckler_{args.model_type}_best.pt")
+
     for epoch in range(1, args.epochs + 1):
         model.train()
-        epoch_loss = 0.0
-        for corrupted, clean in loader:
+        train_mse, train_ssim = 0.0, 0.0
+
+        for corrupted, clean in train_loader:
             corrupted = corrupted.to(device)
             clean = clean.to(device)
 
             optimizer.zero_grad()
             pred = model(corrupted)
-            loss = mse_fn(pred, clean) + args.ssim_weight * ssim_loss(pred, clean)
-            loss.backward()
+
+            loss_mse = mse_fn(pred, clean)
+            loss_ssim = ssim_loss(pred, clean)
+            total_loss = loss_mse + args.ssim_weight * loss_ssim
+
+            total_loss.backward()
             optimizer.step()
 
-            epoch_loss += loss.item()
+            train_mse += loss_mse.item()
+            train_ssim += (1.0 - loss_ssim.item())
 
-        avg_loss = epoch_loss / len(loader)
+        n_train = len(train_loader)
+        avg_train_mse = train_mse / n_train
+        avg_train_ssim = train_ssim / n_train
+
+        # Validation pass
+        model.eval()
+        val_mse, val_ssim = 0.0, 0.0
+        with torch.no_grad():
+            for corrupted, clean in val_loader:
+                corrupted = corrupted.to(device)
+                clean = clean.to(device)
+
+                pred = model(corrupted)
+                v_mse = mse_fn(pred, clean)
+                v_ssim = ssim_loss(pred, clean)
+
+                val_mse += v_mse.item()
+                val_ssim += (1.0 - v_ssim.item())
+
+        n_val = len(val_loader)
+        avg_val_mse = val_mse / n_val
+        avg_val_ssim = val_ssim / n_val
+        total_val_loss = avg_val_mse + args.ssim_weight * (1.0 - avg_val_ssim)
+
+        # Log metrics to TensorBoard
+        writer.add_scalar("Loss/Train_MSE", avg_train_mse, epoch)
+        writer.add_scalar("Metrics/Train_SSIM", avg_train_ssim, epoch)
+        writer.add_scalar("Loss/Val_MSE", avg_val_mse, epoch)
+        writer.add_scalar("Metrics/Val_SSIM", avg_val_ssim, epoch)
+
         if epoch % max(1, args.epochs // 10) == 0 or epoch == args.epochs:
-            print(f"    Epoch [{epoch}/{args.epochs}] loss={avg_loss:.6f}")
+            print(f"    Epoch [{epoch}/{args.epochs}] Train MSE: {avg_train_mse:.5f}, SSIM: {avg_train_ssim:.4f} | Val MSE: {avg_val_mse:.5f}, SSIM: {avg_val_ssim:.4f}")
 
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            os.makedirs(args.output_dir, exist_ok=True)
-            ckpt_path = os.path.join(args.output_dir, "despeckler_best.pt")
-            torch.save(model.state_dict(), ckpt_path)
+        if total_val_loss < best_val_loss:
+            best_val_loss = total_val_loss
+            torch.save(model.state_dict(), best_ckpt_path)
 
-    print(f"[+] Training complete. Best loss: {best_loss:.6f}")
-    print(f"[+] Checkpoint saved to {ckpt_path}")
-    return ckpt_path
+    writer.close()
+    print(f"[+] Training complete for {args.model_type.upper()}. Best checkpoint: {best_ckpt_path}")
+    return best_ckpt_path
 
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Train Spiking Despeckler (Stage 1)")
-    p.add_argument("--data-dir", type=str, default=None,
-                    help="Path to clean images. If omitted, uses synthetic terrain.")
-    p.add_argument("--output-dir", type=str, default="../../exports",
-                    help="Directory to save checkpoints.")
-    p.add_argument("--epochs", type=int, default=30)
-    p.add_argument("--batch-size", type=int, default=16)
+    p = argparse.ArgumentParser(description="Train Despeckler (CNN Default or SNN Baseline)")
+    p.add_argument("--model-type", type=str, choices=["cnn", "snn"], default="cnn")
+    p.add_argument("--train-split", type=str, default="data/splits/train.csv")
+    p.add_argument("--val-split", type=str, default="data/splits/val.csv")
+    p.add_argument("--processed-dir", type=str, default="data/processed/nlm")
+    p.add_argument("--output-dir", type=str, default="exports")
+    p.add_argument("--runs-dir", type=str, default="runs")
+    p.add_argument("--epochs", type=int, default=15)
+    p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--base-ch", type=int, default=32)
-    p.add_argument("--num-steps", type=int, default=8,
-                    help="Number of spiking timesteps T.")
-    p.add_argument("--beta", type=float, default=0.85,
-                    help="LIF membrane decay rate.")
-    p.add_argument("--ssim-weight", type=float, default=0.5,
-                    help="Weight of SSIM loss relative to MSE.")
-    p.add_argument("--height", type=int, default=128)
-    p.add_argument("--width", type=int, default=128)
-    p.add_argument("--num-synthetic", type=int, default=1000,
-                    help="Number of synthetic terrain samples if no data-dir.")
+    p.add_argument("--num-steps", type=int, default=4, help="SNN timesteps T")
+    p.add_argument("--beta", type=float, default=0.85, help="SNN decay beta")
+    p.add_argument("--ssim-weight", type=float, default=0.5)
+    p.add_argument("--height", type=int, default=256)
+    p.add_argument("--width", type=int, default=256)
+    p.add_argument("--num-synthetic", type=int, default=200, help="Fallback synthetic samples if no CSV")
+    p.add_argument("--workers", type=int, default=0)
+    p.add_argument("--force-cpu", action="store_true")
+    p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
 
 if __name__ == "__main__":
-    train(parse_args())
+    train_despeckler(parse_args())

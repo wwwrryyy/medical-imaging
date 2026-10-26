@@ -72,15 +72,15 @@ def corrupt_image(image: np.ndarray, rng: np.random.Generator = None) -> np.ndar
     mode = rng.choice(["rayleigh", "gamma", "both"])
 
     if mode == "rayleigh":
-        scale = rng.uniform(0.15, 0.5)
+        scale = rng.uniform(0.08, 0.22)
         return apply_rayleigh_speckle(image, scale=scale)
     elif mode == "gamma":
-        num_looks = rng.uniform(1.0, 5.0)
+        num_looks = rng.uniform(6.0, 18.0)
         return apply_gamma_speckle(image, num_looks=num_looks)
     else:
-        # Chain both for extreme corruption
-        scale = rng.uniform(0.15, 0.35)
-        num_looks = rng.uniform(2.0, 5.0)
+        # Combined Rayleigh + Gamma for realistic speckle texture
+        scale = rng.uniform(0.06, 0.15)
+        num_looks = rng.uniform(8.0, 20.0)
         result = apply_rayleigh_speckle(image, scale=scale)
         result = apply_gamma_speckle(result, num_looks=num_looks)
         return result
