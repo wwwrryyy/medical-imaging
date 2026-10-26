@@ -1,9 +1,7 @@
 """
 validate.py
 ===========
-PyTorch ↔ ONNX Runtime equivalence validation and latency benchmarking for:
-1. ConvUNet (CNN Default)
-2. SpikingUNet (SNN Baseline)
+PyTorch ↔ ONNX Runtime equivalence validation and latency benchmarking for ConvUNet.
 
 Asserts that ONNX outputs match native PyTorch within 10⁻⁴ tolerance and measures
 mean edge inference latency against the ≥15 FPS (≤66.6 ms) target.
@@ -18,21 +16,18 @@ import torch
 import onnxruntime as ort
 
 try:
-    from model import get_despeckler
+    from model import ConvUNet
 except ImportError:
-    from models.despeckler.model import get_despeckler
+    from models.despeckler.model import ConvUNet
 
 
 def validate(args):
     device = torch.device("cpu")
 
     # --- Load PyTorch model ---
-    model = get_despeckler(
-        model_type=args.model_type,
+    model = ConvUNet(
         in_channels=1,
         base_ch=args.base_ch,
-        num_steps=args.num_steps,
-        beta=args.beta,
     ).to(device)
 
     if args.checkpoint and os.path.exists(args.checkpoint):
@@ -97,7 +92,7 @@ def validate(args):
     p95_lat = np.percentile(latencies, 95)
     fps = 1000.0 / mean_lat
 
-    print(f"[+] {args.model_type.upper()} ONNX Runtime CPU Latency ({args.height}x{args.width}):")
+    print(f"[+] ConvUNet ONNX Runtime CPU Latency ({args.height}x{args.width}):")
     print(f"    - Mean: {mean_lat:.2f} ms")
     print(f"    - P95:  {p95_lat:.2f} ms")
     print(f"    - Throughput: {fps:.1f} FPS (Target: ≥15.0 FPS)")
@@ -108,21 +103,18 @@ def validate(args):
         print(f"    - Status: [WARN] Below 15 FPS on this host.")
 
     if num_passed == args.num_samples:
-        print(f"[+] VALIDATION PASSED for {args.model_type.upper()}!")
+        print(f"[+] VALIDATION PASSED for ConvUNet!")
         return 0
     else:
-        print(f"[!] VALIDATION FAILED for {args.model_type.upper()}: Numerical divergence.")
+        print(f"[!] VALIDATION FAILED: Numerical divergence.")
         return 1
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="Validate PyTorch ↔ ONNX equivalence and benchmark latency")
-    p.add_argument("--model-type", type=str, choices=["cnn", "snn"], default="cnn")
-    p.add_argument("--checkpoint", type=str, default=None)
+    p.add_argument("--checkpoint", type=str, default="exports/despeckler_cnn_best.pt")
     p.add_argument("--onnx", type=str, default="exports/unet_despeckler.onnx")
     p.add_argument("--base-ch", type=int, default=32)
-    p.add_argument("--num-steps", type=int, default=4)
-    p.add_argument("--beta", type=float, default=0.85)
     p.add_argument("--height", type=int, default=256)
     p.add_argument("--width", type=int, default=256)
     p.add_argument("--tolerance", type=float, default=1e-4)

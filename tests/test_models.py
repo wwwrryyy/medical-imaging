@@ -2,13 +2,14 @@
 tests/test_models.py
 ====================
 Unit tests verifying architecture, shape integrity, and gradient flow for:
-1. ConvUNet (CNN Default)
-2. SpikingUNet (SNN Baseline, T=4)
+1. ConvUNet (Stage 1 Continuous Despeckler)
+2. ConvAutoencoder (Stage 2 Continuous Tissue Baseline Autoencoder)
 """
 
 import pytest
 import torch
-from models.despeckler.model import ConvUNet, SpikingUNet, get_despeckler
+from models.despeckler.model import ConvUNet, get_despeckler
+from models.anomaly_detector.autoencoder import ConvAutoencoder
 
 
 def test_conv_unet_shape_and_range():
@@ -19,33 +20,29 @@ def test_conv_unet_shape_and_range():
     assert out.min() >= 0.0 and out.max() <= 1.0, "Output must be bounded in [0, 1] by sigmoid"
 
 
-def test_spiking_unet_shape_and_range():
-    model = SpikingUNet(in_channels=1, base_ch=16, num_steps=4)
+def test_conv_autoencoder_shape_and_range():
+    model = ConvAutoencoder(in_channels=1)
     x = torch.rand(2, 1, 128, 128)
     out = model(x)
     assert out.shape == (2, 1, 128, 128), f"Expected (2, 1, 128, 128), got {out.shape}"
     assert out.min() >= 0.0 and out.max() <= 1.0, "Output must be bounded in [0, 1] by sigmoid"
 
 
-def test_gradient_flow_both_models():
-    # Test CNN
-    cnn = get_despeckler("cnn", in_channels=1, base_ch=16)
-    x_cnn = torch.rand(1, 1, 64, 64)
+def test_conv_unet_gradient_flow():
+    model = get_despeckler(in_channels=1, base_ch=16)
+    x = torch.rand(1, 1, 64, 64)
     target = torch.rand(1, 1, 64, 64)
-    loss_cnn = torch.nn.functional.mse_loss(cnn(x_cnn), target)
-    loss_cnn.backward()
-    assert cnn.enc1.conv.weight.grad is not None, "Gradient must flow back to CNN encoder"
-    assert torch.isfinite(cnn.enc1.conv.weight.grad).all(), "Gradients must be finite"
-
-    # Test SNN
-    snn = get_despeckler("snn", in_channels=1, base_ch=16, num_steps=3)
-    x_snn = torch.rand(1, 1, 64, 64)
-    loss_snn = torch.nn.functional.mse_loss(snn(x_snn), target)
-    loss_snn.backward()
-    assert snn.enc1.conv.weight.grad is not None, "Gradient must flow back to SNN encoder"
-    assert torch.isfinite(snn.enc1.conv.weight.grad).all(), "Gradients must be finite"
+    loss = torch.nn.functional.mse_loss(model(x), target)
+    loss.backward()
+    assert model.enc1.conv.weight.grad is not None, "Gradient must flow back to ConvUNet encoder"
+    assert torch.isfinite(model.enc1.conv.weight.grad).all(), "Gradients must be finite"
 
 
-def test_factory_error_handling():
-    with pytest.raises(ValueError):
-        get_despeckler("transformer")
+def test_conv_autoencoder_gradient_flow():
+    model = ConvAutoencoder(in_channels=1)
+    x = torch.rand(1, 1, 64, 64)
+    target = torch.rand(1, 1, 64, 64)
+    loss = torch.nn.functional.mse_loss(model(x), target)
+    loss.backward()
+    assert model.enc[0].weight.grad is not None, "Gradient must flow back to autoencoder encoder"
+    assert torch.isfinite(model.enc[0].weight.grad).all(), "Gradients must be finite"

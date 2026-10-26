@@ -2,8 +2,7 @@
 train.py
 ========
 Training pipeline for Stage 1 Despeckling:
-1. ConvUNet (CNN Default, T=1, continuous activations)
-2. SpikingUNet (SNN Baseline, T=4, Leaky Integrate-and-Fire dynamics)
+Continuous Convolutional U-Net (ConvUNet) on Optical Coherence Tomography (OCT).
 
 Loss Function: MSE + lambda * (1 - SSIM)
 Hardware: Apple Silicon MPS / NVIDIA CUDA / CPU
@@ -26,10 +25,10 @@ from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 try:
-    from model import get_despeckler
+    from model import ConvUNet
     from corruption import corrupt_image, load_and_normalize
 except ImportError:
-    from models.despeckler.model import get_despeckler
+    from models.despeckler.model import ConvUNet
     from models.despeckler.corruption import corrupt_image, load_and_normalize
 
 
@@ -111,8 +110,6 @@ class OCTDespeckleDataset(Dataset):
                     raw_p = Path(row["image_path"])
                     cls_name = row["class"]
                     target_p = Path(processed_dir) / split_name / cls_name / f"{raw_p.stem}.png"
-                    
-                    # If precomputed target exists, use it; else fallback to raw resized
                     clean_source = str(target_p) if target_p.exists() else str(raw_p)
                     self.pairs.append(clean_source)
 
@@ -131,7 +128,6 @@ class OCTDespeckleDataset(Dataset):
         y = np.linspace(0, 1, self.h)
         xx, yy = np.meshgrid(x, y)
         freq = self.rng.uniform(3.0, 8.0)
-        # Layered retinal bands with horizontal stratification
         layers = 0.5 + 0.3 * np.sin(freq * yy) * np.cos(1.0 * xx)
         texture = self.rng.normal(0.0, 0.03, (self.h, self.w))
         return np.clip(layers + texture, 0.0, 1.0).astype(np.float32)
@@ -149,7 +145,6 @@ class OCTDespeckleDataset(Dataset):
                     img = cv2.resize(img, (self.w, self.h), interpolation=cv2.INTER_AREA)
                 clean = img.astype(np.float32) / 255.0
 
-        # Apply calibrated multiplicative speckle
         corrupted = corrupt_image(clean, rng=self.rng)
 
         clean_t = torch.from_numpy(clean[np.newaxis])
@@ -162,7 +157,6 @@ class OCTDespeckleDataset(Dataset):
 # ---------------------------------------------------------------------------
 
 def train_despeckler(args):
-    # Select hardware device: Apple Silicon MPS -> CUDA -> CPU
     if torch.backends.mps.is_available() and not args.force_cpu:
         device = torch.device("mps")
     elif torch.cuda.is_available() and not args.force_cpu:
@@ -171,15 +165,9 @@ def train_despeckler(args):
         device = torch.device("cpu")
 
     print(f"[*] Training Device: {device}")
-    print(f"[*] Architecture: {args.model_type.upper()} Despeckler (base_ch={args.base_ch})")
+    print(f"[*] Architecture: ConvUNet Despeckler (base_ch={args.base_ch})")
 
-    model = get_despeckler(
-        model_type=args.model_type,
-        in_channels=1,
-        base_ch=args.base_ch,
-        num_steps=args.num_steps,
-        beta=args.beta,
-    ).to(device)
+    model = ConvUNet(in_channels=1, base_ch=args.base_ch).to(device)
 
     train_dataset = OCTDespeckleDataset(
         split_csv=args.train_split,
@@ -204,14 +192,14 @@ def train_despeckler(args):
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     mse_fn = nn.MSELoss()
 
-    log_dir = os.path.join(args.runs_dir, f"{args.model_type}_despeckler")
+    log_dir = os.path.join(args.runs_dir, "cnn_despeckler")
     writer = SummaryWriter(log_dir=log_dir)
 
     print(f"[+] Starting training for {args.epochs} epochs ({len(train_dataset)} train, {len(val_dataset)} val)...")
 
     best_val_loss = float("inf")
     os.makedirs(args.output_dir, exist_ok=True)
-    best_ckpt_path = os.path.join(args.output_dir, f"despeckler_{args.model_type}_best.pt")
+    best_ckpt_path = os.path.join(args.output_dir, "despeckler_cnn_best.pt")
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -272,24 +260,21 @@ def train_despeckler(args):
             torch.save(model.state_dict(), best_ckpt_path)
 
     writer.close()
-    print(f"[+] Training complete for {args.model_type.upper()}. Best checkpoint: {best_ckpt_path}")
+    print(f"[+] Training complete for ConvUNet. Best checkpoint: {best_ckpt_path}")
     return best_ckpt_path
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Train Despeckler (CNN Default or SNN Baseline)")
-    p.add_argument("--model-type", type=str, choices=["cnn", "snn"], default="cnn")
+    p = argparse.ArgumentParser(description="Train Continuous ConvUNet Despeckler")
     p.add_argument("--train-split", type=str, default="data/splits/train.csv")
     p.add_argument("--val-split", type=str, default="data/splits/val.csv")
     p.add_argument("--processed-dir", type=str, default="data/processed/nlm")
     p.add_argument("--output-dir", type=str, default="exports")
     p.add_argument("--runs-dir", type=str, default="runs")
     p.add_argument("--epochs", type=int, default=15)
-    p.add_argument("--batch-size", type=int, default=8)
+    p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--base-ch", type=int, default=32)
-    p.add_argument("--num-steps", type=int, default=4, help="SNN timesteps T")
-    p.add_argument("--beta", type=float, default=0.85, help="SNN decay beta")
     p.add_argument("--ssim-weight", type=float, default=0.5)
     p.add_argument("--height", type=int, default=256)
     p.add_argument("--width", type=int, default=256)

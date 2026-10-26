@@ -7,8 +7,8 @@
 
 /**
  * @brief Anomaly Calculus Engine (Mathematical Detection)
- * Computes pixel-wise Mean Squared Error (MSE) between raw input frames and SNN reconstructed baselines.
- * Generates spatial anomaly heatmaps flagging camouflaged threats, hidden assets, and disturbed terrain.
+ * Computes pixel-wise Mean Squared Error (MSE) between despeckled input frames and autoencoder reconstructed baselines.
+ * Generates spatial anomaly heatmaps flagging tissue lesions, structural pathology, and abnormalities.
  */
 class AnomalyCalculus {
 private:
@@ -22,7 +22,7 @@ public:
     /**
      * @brief Computes pixel-wise MSE heatmap matrix.
      * @param raw_frame Input OpenCV frame (BGR or Grayscale, CV_8U or CV_32F).
-     * @param recon_frame Reconstructed baseline frame from SNN Autoencoder.
+     * @param recon_frame Reconstructed baseline frame from Convolutional Autoencoder.
      * @param heatmap_out Output CV_32FC1 floating point MSE matrix.
      * @return Mean MSE score across the entire frame.
      */

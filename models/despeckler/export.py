@@ -1,11 +1,10 @@
 """
 export.py
 =========
-PyTorch → ONNX export for Stage 1 Despeckler:
-1. ConvUNet (CNN Default, T=1)
-2. SpikingUNet (SNN Baseline, T=4 static temporal unrolling)
+PyTorch → ONNX export for Stage 1 Despeckler (ConvUNet).
 
-Produces production-ready ONNX models compatible with ONNX Runtime CPU / ARM.
+Produces a clean, single-pass continuous computation graph (T=1) compatible with
+ONNX Runtime CPU / ARM for embedded point-of-care deployment.
 """
 
 import os
@@ -13,20 +12,17 @@ import argparse
 import torch
 
 try:
-    from model import get_despeckler
+    from model import ConvUNet
 except ImportError:
-    from models.despeckler.model import get_despeckler
+    from models.despeckler.model import ConvUNet
 
 
 def export_onnx(args):
-    device = torch.device("cpu")  # Export on CPU for embedded portability
+    device = torch.device("cpu")  # Export on CPU for portability
 
-    model = get_despeckler(
-        model_type=args.model_type,
+    model = ConvUNet(
         in_channels=1,
         base_ch=args.base_ch,
-        num_steps=args.num_steps,
-        beta=args.beta,
     ).to(device)
 
     # Load trained weights if provided
@@ -40,16 +36,11 @@ def export_onnx(args):
     model.eval()
 
     dummy = torch.randn(1, 1, args.height, args.width, device=device)
-    output_path = args.output
-    if not output_path:
-        default_name = "unet_despeckler.onnx" if args.model_type == "cnn" else f"sunet_despeckler_static_t{args.num_steps}.onnx"
-        output_path = os.path.join("exports", default_name)
+    output_path = args.output or os.path.join("exports", "unet_despeckler.onnx")
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
-    print(f"[*] Exporting {args.model_type.upper()} model to ONNX: {output_path}")
-    if args.model_type == "snn":
-        print(f"    Static temporal unrolling with T={args.num_steps} timesteps...")
+    print(f"[*] Exporting ConvUNet model to ONNX: {output_path}")
 
     torch.onnx.export(
         model,
@@ -68,23 +59,17 @@ def export_onnx(args):
     )
 
     size_kb = os.path.getsize(output_path) / 1024
-    print(f"[+] Successfully exported {args.model_type.upper()} to: {output_path} ({size_kb:.1f} KB)")
+    print(f"[+] Successfully exported ConvUNet to: {output_path} ({size_kb:.1f} KB)")
     return output_path
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Export Despeckler to ONNX")
-    p.add_argument("--model-type", type=str, choices=["cnn", "snn"], default="cnn",
-                    help="Model architecture ('cnn' default, 'snn' baseline)")
-    p.add_argument("--checkpoint", type=str, default=None,
+    p = argparse.ArgumentParser(description="Export ConvUNet Despeckler to ONNX")
+    p.add_argument("--checkpoint", type=str, default="exports/despeckler_cnn_best.pt",
                     help="Path to trained .pt checkpoint")
-    p.add_argument("--output", type=str, default=None,
-                    help="Output ONNX file path (defaults to exports/unet_despeckler.onnx or exports/sunet_despeckler_static_t4.onnx)")
+    p.add_argument("--output", type=str, default="exports/unet_despeckler.onnx",
+                    help="Output ONNX file path")
     p.add_argument("--base-ch", type=int, default=32)
-    p.add_argument("--num-steps", type=int, default=4,
-                    help="Number of spiking timesteps T (SNN only)")
-    p.add_argument("--beta", type=float, default=0.85,
-                    help="LIF membrane decay rate (SNN only)")
     p.add_argument("--height", type=int, default=256)
     p.add_argument("--width", type=int, default=256)
     p.add_argument("--opset", type=int, default=17)
