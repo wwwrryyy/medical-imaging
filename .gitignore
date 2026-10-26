@@ -22,3 +22,7 @@ cmake_install.cmake
 
 # macOS
 .DS_Store
+
+# Documentation (local only)
+*.md
+
